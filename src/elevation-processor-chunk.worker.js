@@ -83,11 +83,11 @@ self.onmessage = function (event) {
 
         if (localIdx >= elevationData.length) continue;
 
-        const v = elevationData[localIdx];
+        let v = elevationData[localIdx];
         if (!Number.isFinite(v)) v = minV;
+        // ✅ 0~1 정규화 (클램핑 포함)
         let v01 = (v - minV) / denom;
-        if (v01 < 0) v01 = 0;
-        if (v01 > 1) v01 = 1;
+        v01 = v01 < 0 ? 0 : (v01 > 1 ? 1 : v01);
         const elevation = v01 * heightScale;
 
         positions[posIdx] = x - width / 2;

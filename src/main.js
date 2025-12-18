@@ -105,6 +105,11 @@ function mergeProcesedChunks() {
 function onParallelProcessingComplete(data) {
   const { positions, colors, width, height, isRecreate } = data;
 
+  // ✅ 처리 완료 알림
+  if (setupMQTTHandlers.markProcessingComplete) {
+    setupMQTTHandlers.markProcessingComplete();
+  }
+
   if (!terrain || !terrain.geometry) {
     logError("❌ 지형 메시 초기화 오류");
     return;
@@ -205,6 +210,15 @@ const PERF_CONFIG = {
   disableStatusMonitoring: true,
   useParallelWorkers: true,
   useWorkerProcessing: false,
+};
+
+// ==========================================
+// 고도 데이터 정규화 설정 (0~500+ → 0~1)
+// ==========================================
+const ELEVATION_CONFIG = {
+  minElevation: 0,      // 최소 고도값
+  maxElevation: 500,    // 최대 고도값 (이 이상은 클램핑)
+  heightScale: 10,      // 3D 시각화 높이 스케일
 };
 
 function log(...args) {
@@ -606,16 +620,27 @@ function updateTerrainOptimized(newData) {
     return;
   }
 
+  // ✅ data 배열을 Float32Array로 변환 (성능 + Transferable)
+  const elevationData = data instanceof Float32Array 
+    ? data 
+    : new Float32Array(data);
+
   if (PERF_CONFIG.useParallelWorkers && workerPool.length > 0) {
     try {
       const expectedVertexCount = width * height;
       const chunkSize = Math.ceil(expectedVertexCount / WORKER_POOL_SIZE);
 
-      // ✅ 실제 필요한 청크 수 (startIdx가 expectedVertexCount를 넘지 않게)
       const actualChunks = Math.min(
         WORKER_POOL_SIZE,
         Math.ceil(expectedVertexCount / chunkSize)
       );
+
+      // ✅ 고정 정규화 범위 사용 (동적 min/max 계산 제거)
+      const { minElevation, maxElevation, heightScale } = ELEVATION_CONFIG;
+
+      // 현재 지오메트리 크기와 비교하여 재생성 여부 결정
+      const currentVertexCount = terrain.geometry.getAttribute('position')?.count || 0;
+      const isRecreate = currentVertexCount !== expectedVertexCount;
 
       chunkProcessingState = {
         _totalChunks: actualChunks,
@@ -627,7 +652,6 @@ function updateTerrainOptimized(newData) {
         const endIdx = Math.min((i + 1) * chunkSize, expectedVertexCount);
 
         if (startIdx >= endIdx) {
-          // 방어코드 (이제 거의 안 걸림)
           chunkProcessingState[`chunk_${i}`] = {
             complete: true,
             startIdx,
@@ -638,22 +662,8 @@ function updateTerrainOptimized(newData) {
           continue;
         }
 
+        // ✅ 원본 배열에서 슬라이스 (복사본 생성)
         const chunkElev = elevationData.slice(startIdx, endIdx);
-
-        // (샘플링) min/max 대충 추정: 비용 거의 없이 안정성 크게 올라감
-        let minV = Infinity,
-          maxV = -Infinity;
-        const step = Math.max(1, Math.floor(elevationData.length / 1024));
-        for (let k = 0; k < elevationData.length; k += step) {
-          const v = elevationData[k];
-          if (!Number.isFinite(v)) continue;
-          if (v < minV) minV = v;
-          if (v > maxV) maxV = v;
-        }
-        if (!Number.isFinite(minV) || !Number.isFinite(maxV) || minV === maxV) {
-          minV = 0;
-          maxV = 1; // fallback
-        }
 
         workerPool[i].postMessage(
           {
@@ -665,12 +675,12 @@ function updateTerrainOptimized(newData) {
               startIdx,
               endIdx,
               chunkId: `chunk_${i}`,
-              minV,
-              maxV, // ✅ 추가
-              heightScale: 3, // ✅ 기존 3 상수도 변수로
+              minV: minElevation,      // ✅ 고정값 사용
+              maxV: maxElevation,      // ✅ 고정값 사용
+              heightScale,             // ✅ 설정에서 가져옴
             },
           },
-          [chunkElev.buffer]
+          [chunkElev.buffer]  // Transferable로 전송
         );
 
         chunkProcessingState[`chunk_${i}`] = { complete: false };
@@ -728,6 +738,10 @@ function fallbackUpdateTerrainOptimized(newData) {
     return;
   }
 
+  // ✅ 고정 정규화 범위 사용
+  const { minElevation, maxElevation, heightScale } = ELEVATION_CONFIG;
+  const range = maxElevation - minElevation || 1;
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = y * width + x;
@@ -738,12 +752,17 @@ function fallbackUpdateTerrainOptimized(newData) {
         continue;
       }
 
-      const elevation = data[idx] * 3;
+      // ✅ 0~1 정규화 (클램핑 포함)
+      const rawValue = data[idx];
+      let normalized = (rawValue - minElevation) / range;
+      normalized = Math.max(0, Math.min(1, normalized)); // 0~1 클램핑
+      
+      const elevation = normalized * heightScale;
       positions[posIdx] = x - width / 2;
       positions[posIdx + 1] = elevation;
       positions[posIdx + 2] = y - height / 2;
 
-      const hue = (1 - data[idx]) * 240;
+      const hue = (1 - normalized) * 240;
       const color = getColorFromHue(hue);
       colors[posIdx] = color.r;
       colors[posIdx + 1] = color.g;
@@ -785,7 +804,7 @@ function updateTerrain(newData) {
 }
 
 // ==========================================
-// MQTT 핸들러 (Latest-wins + rAF)
+// MQTT 핸들러 (Latest-wins + 쓰로틀링)
 // ==========================================
 function setupMQTTHandlers(client) {
   // MQTT 메시지 수신 시간 추적
@@ -797,6 +816,11 @@ function setupMQTTHandlers(client) {
   const decoder = new TextDecoder();
   let latestMessageText = null;
   let applyScheduled = false;
+  
+  // ✅ 처리 중 플래그 (Worker 완료 전 새 작업 방지)
+  let isProcessing = false;
+  let lastProcessTime = 0;
+  const MIN_PROCESS_INTERVAL = 100; // 최소 100ms 간격 (최대 10fps)
 
   const scheduleApply = () => {
     if (applyScheduled) return;
@@ -805,9 +829,22 @@ function setupMQTTHandlers(client) {
     requestAnimationFrame(() => {
       applyScheduled = false;
       if (!latestMessageText) return;
+      
+      // ✅ 쓰로틀링: 이전 처리 완료 전 또는 최소 간격 미달 시 스킵
+      const now = performance.now();
+      if (isProcessing || (now - lastProcessTime) < MIN_PROCESS_INTERVAL) {
+        // 다음 프레임에 다시 시도
+        if (latestMessageText) {
+          applyScheduled = false;
+          requestAnimationFrame(() => scheduleApply());
+        }
+        return;
+      }
 
       const text = latestMessageText;
       latestMessageText = null;
+      isProcessing = true;
+      lastProcessTime = now;
 
       try {
         const raw = JSON.parse(text);
@@ -820,14 +857,27 @@ function setupMQTTHandlers(client) {
 
         if (!validateElevationData(terrainData)) {
           logError("❌ 고도 데이터 검증 실패");
+          isProcessing = false;
           return;
         }
 
         updateTerrain(terrainData);
+        
+        // ✅ Worker 사용 시 비동기 완료, 아니면 즉시 완료
+        if (!PERF_CONFIG.useParallelWorkers || workerPool.length === 0) {
+          isProcessing = false;
+        }
+        // Worker 사용 시 onParallelProcessingComplete에서 isProcessing = false 처리
       } catch (e) {
         logError("❌ MQTT 메시지 파싱 오류:", e.message);
+        isProcessing = false;
       }
     });
+  };
+  
+  // ✅ 외부에서 처리 완료 알림 받을 수 있도록 노출
+  setupMQTTHandlers.markProcessingComplete = () => {
+    isProcessing = false;
   };
 
   client.on("message", (topic, message) => {
